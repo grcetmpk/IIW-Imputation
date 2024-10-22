@@ -8,6 +8,8 @@ require(doParallel)
 library(Rcpp)
 require(mice)
 library(missForest)
+library(geepack)
+library(splines)
 
 expit <- function(x){ return(exp(x)/(1+exp(x)))}
 
@@ -21,10 +23,12 @@ ncoresavailable <- parallel::detectCores()
 ### from 0 to \tau, by 0.01. First, starting with a non-time-varying treatment
 
 
-gendata_IIW <- function(n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, gamma3, gamma4, gamma5, gamma6, tau){
+gendata_IIW_continuous <- function(n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, gamma3, gamma4, gamma5, gamma6, tau){
   
   # Simulates observation times using bernoulli draws with probabilities proportional 
   # to the intensity. assume the treatment is time-invariant and randomized
+  #
+  # Simulates continuous outcome
   #
   # n: number of subjects
   # tau: maximum follow up
@@ -67,12 +71,9 @@ gendata_IIW <- function(n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, ga
     
     V2 <- ifelse(D[1] == 0, runif(1, 0, 1), runif(1, 1, 2))
     
-    # generate V3(t) which is categorical
-    if(D[1] == 0){
-      pV3t <- c(0.1, 0.4, 0.5)
-    }else{
-      pV3t <- c(0.7, 0.2, 0.1)
-    }
+    # generate V3(t) which is binary
+    V3 <- ifelse(D[1] == 0, rbinom(1, 1, 0.2), rbinom(1, 1, 0.7))
+    
     
     V3t <- sample(c(0,1,2), length(disctimes), pV3t, replace = TRUE)
     
@@ -105,7 +106,7 @@ gendata_IIW <- function(n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, ga
     
     simdata$cexp_V1_D <- ifelse(simdata$D == 0, mu_V1_D0, mu_V1_D1)
     simdata$cexp_V2_D <- ifelse(simdata$D == 0, 0.5, 1.5)*log(simdata$times + 1)
-    simdata$cexp_V3_D <- ifelse(simdata$D == 0, 0.1*0 + 0.4*1 + 0.5*2, 0.7*0 + 0.2*1 + 0.1*2)
+    simdata$cexp_V3_D <- ifelse(simdata$D == 0, 0.2, 0.7)
     simdata$cexp_V4_D <- 0.3 # not dependent on D
     simdata$cexp_V5_D <- 0.5 # not dependent on D (and not involved in the generation of Y) 
     
@@ -158,6 +159,160 @@ gendata_IIW <- function(n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, ga
   return(out) 
   
 }
+
+gendata_IIW_binary <- function(n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, gamma3, gamma4, gamma5, gamma6, tau){
+  
+  # Simulates observation times using bernoulli draws with probabilities proportional 
+  # to the intensity. assume the treatment is time-invariant and randomized
+  #
+  # Simulates continuous outcome
+  #
+  # n: number of subjects
+  # tau: maximum follow up
+  
+  
+  mu_V1_D0 <- 1
+  var_V1_D0 <- 0.25 
+  mu_V1_D1 <- 2
+  var_V1_D1 <- 0.5
+  
+  var_phi <- 0.25
+  var_epsilon <- 1
+  
+  
+  # generate subjects one by one and then combine
+  id <- 1
+  simdatafull <- data.frame(matrix(NA, ncol = 19))
+  colnames(simdatafull) <- c("id", "times", "D", "V1t", "V2t", "V3t", "V4t", "V5t", "censortime", "eta", "cexp_V1_D", "cexp_V2_D", 
+                             "cexp_V3_D", "cexp_V4_D", "cvar_V1_D", "cvar_V2_D", 
+                             "cvar_V3_D", "cvar_V4_D", "y")
+  
+  
+  disctimes <- seq(0, tau, by = 0.01)
+  
+  while(id <= n){
+    
+    ## Generate Covariates
+    
+    ## Generate baseline covariate
+    
+    # generate treatment assignment (time-invariant) at each time point
+    D <- rep(rbinom(1, 1, 0.5), length(disctimes))
+    
+    
+    # generate observation times confounder (time varying) V1t ~ N( mu_V_D0, var_V_D0) if D(t) = 0 and 
+    # N( mu_V_D1, var_V_D1) if D = 1
+    
+    V1t <- ifelse(D == 0, rnorm(1, mu_V1_D0, sqrt(var_V1_D0)), rnorm(1, mu_V1_D1, sqrt(var_V1_D1)))
+    
+    # generate V2 (which will be used in V2(t) = V2log(t)
+    
+    V2 <- ifelse(D[1] == 0, runif(1, 0, 1), runif(1, 1, 2))
+    V2t <- V2*log(disctimes + 0.01)
+    
+    # generate V3(t) which is binary
+    V3 <- ifelse(D[1] == 0, rbinom(1, 1, 0.2), rbinom(1, 1, 0.7))
+    V3t <- rep(V3, length(disctimes))
+    
+    # generate V4(t)
+    
+    V4t <- rbinom(length(disctimes), 1, 0.3)
+    
+    # generate V5, which will be used in V5(t)
+    
+    V5 <- rnorm(1, 0, 1)
+    V5t <- V5*sqrt(disctimes)/2
+    
+    
+    # generate random effect
+    phi <- rnorm(1, 0, var_phi)
+    
+    
+    # simulate censoring time (uniform)
+    censortime <- runif(1, tau/2, tau)
+    
+    # calculate eta
+    eta <- rgamma(1, shape = 100, scale = 0.01) #eta is for random effect with mean 1 and sd 0.1 
+    #(obs times within subject correlated if sd !0)
+    
+    simdata <- data.frame(rep(id, length(disctimes)), disctimes, D, V1t, V2t, V3t, V4t, V5t, 
+                          rep(censortime, length(disctimes)), rep(eta, length(disctimes)))
+    colnames(simdata) <- c("id", "times", "D", "V1t", "V2t", "V3t", "V4t", "V5t", "censortime", "eta")
+    
+    # need conditional expectation and variance of Z | X
+    
+    simdata$cexp_V1_D <- ifelse(simdata$D == 0, mu_V1_D0, mu_V1_D1)
+    simdata$cexp_V2_D <- ifelse(simdata$D == 0, 0.5, 1.5)*log(simdata$times + 0.01)
+    simdata$cexp_V3_D <- ifelse(simdata$D == 0, 0.2, 0.7)
+    simdata$cexp_V4_D <- 0.3 # not dependent on D
+
+    simdata$cvar_V1_D <- ifelse(simdata$D == 0, var_V1_D0, var_V1_D1)
+    simdata$cvar_V2_D <- 1/12*(log(simdata$times + 0.01))^2
+    simdata$cvar_V3_D <- ifelse(simdata$D == 0, 0.2*0.8, 0.2*0.7)
+    simdata$cvar_V4_D <- 0.3*0.7 # not dependent on D
+
+    
+    M <- sqrt(beta2^2*simdata$cvar_V1_D + beta3^2*simdata$cvar_V2_D + beta4^2*simdata$cvar_V3_D + 
+                beta5^2*simdata$cvar_V4_D + var_epsilon + var_phi)/1.7
+    
+    fstar <- (2-simdata$times)*M - beta2*simdata$cexp_V1_D - beta3*simdata$cexp_V2_D - 
+      beta4*simdata$cexp_V3_D - beta5*simdata$cexp_V4_D
+    
+
+    
+    # generate time-varying outcome at each possible time
+    simdata$y <- ifelse(fstar + beta1*M*simdata$D + beta2*simdata$V1t + beta3*simdata$V2t + 
+                              beta4*simdata$V3t + beta5*simdata$V4t + rep(phi, dim(simdata)[1]) + 
+                          rnorm(dim(simdata)[1], 0, sqrt(var_epsilon)) > 0, 1, 0)
+    
+    
+    
+    simdatafull <- rbind(simdatafull, simdata)
+    
+    
+    
+    
+    id = id + 1
+    
+  }
+  
+  
+  
+  
+  simdata <- simdatafull[-1,] #remove empty first row
+  
+  ### calculate intensities for each counterfactual observation time:
+  
+  
+  simdata$intensities <- simdata$eta*sqrt(simdata$times)/2*exp(gamma1*simdata$D + gamma2*simdata$V1t + gamma3*simdata$V2t +
+                                                                 gamma4*simdata$V3t + gamma5*simdata$V4t + gamma6*simdata$V5t)
+  simdata$prObs <- ifelse(0.01*simdata$intensities > 1, 1, 0.01*simdata$intensities) #simdata$intensities/max(simdata$intensities)
+  simdata$Yobserved <- rbinom(nrow(simdata), 1, simdata$prObs)
+  
+  
+  # simdata <- simdata %>%
+  #   filter(times < censortime)
+  # 
+  
+  ### filter censored observations, unobserved observations (do this before or after calculating maximum intensity???)
+  simdata_observed <- simdata %>%
+    filter(Yobserved == 1)
+  
+  
+  #check the generated data
+  numevents <- summary(tapply(simdata_observed$Yobserved, simdata_observed$id, sum)) 
+  
+  
+  # #also get data for individuals at baseline (all same here)
+  newn <- length(unique(simdata_observed$id)) #number of people after censoring etc
+  
+  out <- list(simdata, simdata_observed, numevents, newn)
+  names(out) <- c("simdata_full", "simdata_Yobserved", "numevents", "newn")
+  
+  return(out) 
+  
+}
+
 
 
 makeMissing <- function(intensitydat, scheme, p){
@@ -274,6 +429,9 @@ makeMissing <- function(intensitydat, scheme, p){
 IIW <- function(intensitydat, obsdat){
   
   ##### perform IIW on the imputed data set
+    
+  # terti<-quantile(0:tau , c(0.3333, 0.66666), type = 1) 
+  terti<-quantile(0:tau , c(0.5), type = 1) 
   
   #include a variable counting observation number, to be used for lagging time for Surv function
   intensitydat$obsnumber <- with(intensitydat, ave(id, id, FUN = seq_along))
@@ -291,7 +449,9 @@ IIW <- function(intensitydat, obsdat){
     exp(cbind(obsdat$D, obsdat$V1t, obsdat$V2t, 
               obsdat$V3t, obsdat$V4t, obsdat$V5t)%*%gamma.hat)
   
-  beta1 <- summary(glm(y ~ D + offset(2-times) - 1, data=obsdat, weights = iiw))$coef[1,1]
+  beta1 <- summary(geeglm(y ~ D + bs(obsdat$time,degree=3,knots=c(terti)), 
+                          family = "binomial", data=obsdat, id = id,
+                          weights = iiw))$coef[2,1]
   
   return(beta1)
   
@@ -310,27 +470,6 @@ CCA <- function(intensitydat, obsdat){
   intensitydat <- na.omit(intensitydat)
   out <- IIW(intensitydat, obsdat)
   return(out)
-  
-  # #include a variable counting observation number, to be used for lagging time for Surv function
-  # intensitydat$obsnumber <- with(intensitydat, ave(id, id, FUN = seq_along))
-  #     
-  # # #create lagged time variable
-  # intensitydat$times.lag <- intensitydat$times[c(nrow(intensitydat ),1:(nrow(intensitydat )-1))]
-  # intensitydat$times.lag[intensitydat$obsnumber == 1] <- -0.01
-  #     
-  # gamma.hat <- coxph(Surv(times.lag, times, Yobserved) ~ D  + V1t + V2t + V3t + V4t + V5t - 1, data = intensitydat)$coef
-  # delta.hat <- coxph(Surv(times.lag, times, Yobserved) ~ D - 1, data = intensitydat)$coef
-  #     
-  # 
-  # #use gamma.hat and delta.hat to estimate IIW, one estimate per observation in the obsdat
-  # 
-  # iiw <- exp(cbind(obsdat$D)%*%delta.hat)/
-  # exp(cbind(obsdat$D, obsdat$V1t, obsdat$V2t, obsdat$V3t, obsdat$V4t, 
-  #           obsdat$V5t)%*%gamma.hat)
-  #     
-  # beta1 <- summary(glm(y ~ D + offset(2-times) - 1, data=obsdat, weights = iiw))$coef[1,1]
-  # 
-  # return(beta1)
 }
 
 
@@ -346,27 +485,6 @@ LOCF <- function(intensitydat, obsdat){
     out <- IIW(imputedintensitydata, obsdat)
     return(out)
     
-    # ##### perform IIW on the imputed data set
-    # 
-    # #include a variable counting observation number, to be used for lagging time for Surv function
-    # imputedintensitydata$obsnumber <- with(imputedintensitydata, ave(id, id, FUN = seq_along))
-    # 
-    # # #create lagged time variable
-    # imputedintensitydata$times.lag <- imputedintensitydata$times[c(nrow(imputedintensitydata ),1:(nrow(imputedintensitydata )-1))]
-    # imputedintensitydata$times.lag[imputedintensitydata$obsnumber == 1] <- -0.01
-    # 
-    # gamma.hat <- coxph(Surv(times.lag, times, Yobserved) ~ D  + V1t + V2t + V3t + V4t + V5t - 1, data = imputedintensitydata)$coef
-    # delta.hat <- coxph(Surv(times.lag, times, Yobserved) ~ D - 1, data = imputedintensitydata)$coef
-    # 
-    # ### perform IIW on the "observed" X and Y data
-    # 
-    # iiw <- exp(cbind(obsdat$D)%*%delta.hat)/
-    #   exp(cbind(obsdat$D, obsdat$V1t, obsdat$V2t, 
-    #             obsdat$V3t, obsdat$V4t, obsdat$V5t)%*%gamma.hat)
-    # 
-    # beta1 <- summary(glm(y ~ D + offset(2-times) - 1, data=obsdat, weights = iiw))$coef[1,1]
-    # 
-    # return(beta1)
   }
   
   
@@ -397,9 +515,11 @@ SI <- function(intensitydat, obsdat){
 }
 
 
-MI <- function(intensitydat, obsdat){
+MI <- function(intensitydat, obsdat, nimputations){
   #regression switching imputation with PPM
   
+  # terti<-quantile(0:tau , c(0.3333, 0.66666), type = 1) 
+  terti<-quantile(0:tau , c(0.5), type = 1) 
 
   #include a variable counting observation number, to be used for lagging time for Surv function
   intensitydat$obsnumber <- with(intensitydat, ave(id, id, FUN = seq_along))
@@ -410,16 +530,13 @@ MI <- function(intensitydat, obsdat){
   
   
   
-  imp <- mice::mice(intensitydat, m = 5, maxit = 5, meth = "pmm", seed = 100, printFlag = F)
-  imputedintensitydat <- complete(imp)
-  
-  intensitydat_imputed_full <- intensitydat #copy original df with missingness
-  
+  imp <- mice::mice(intensitydat, m = nimputations, maxit = 5, meth = "pmm", seed = 100, printFlag = F)
+
 
   ##### perform IIW on the imputed data set
   
-  gamma.hat <- summary(pool(with(imp, coxph(Surv(times.lag, times, Yobserved) ~ D  + V1t + V2t + V3t + V4t + V5t - 1, data = intensitydat))))[,2]
-  delta.hat <- summary(pool(with(imp, coxph(Surv(times.lag, times, Yobserved) ~ D - 1, data = intensitydat))))[,2]
+  gamma.hat <- summary(pool(with(imp, coxph(Surv(times.lag, times, Yobserved) ~ D  + V1t + V2t + V3t + V4t + V5t - 1))))[,2]
+  delta.hat <- summary(pool(with(imp, coxph(Surv(times.lag, times, Yobserved) ~ D - 1))))[,2]
   
   ### perform IIW on the "observed" X and Y data
   
@@ -427,7 +544,9 @@ MI <- function(intensitydat, obsdat){
     exp(cbind(obsdat$D, obsdat$V1t, obsdat$V2t, 
               obsdat$V3t, obsdat$V4t, obsdat$V5t)%*%gamma.hat)
   
-  out <- summary(glm(y ~ D + offset(2-times) - 1, data=obsdat, weights = iiw))$coef[1,1]
+  out <- summary(geeglm(y ~ D + bs(obsdat$time,degree=3,knots=c(terti)), 
+                        family = "binomial", data=obsdat, id = id,
+                        weights = iiw))$coef[2,1]
 
   return(out)
 }
@@ -444,7 +563,7 @@ NIRF <- function(intensitydat, obsdat){
   
   registerDoParallel(cores= ncoresavailable-2)
   start.time <-Sys.time()
-  imp <- missForest(intensitydat2, maxiter = 5, ntree = 50, parallelize = "forests") #change to larger numbers later
+  imp <- missForest(intensitydat2, maxiter = 5, ntree = 25) #parallelize = "forests") #change to larger numbers later
   end.time <- Sys.time()
   time.taken <- end.time - start.time
   # time.taken
@@ -465,24 +584,26 @@ NIRF <- function(intensitydat, obsdat){
 
 
 simulateOneIIW<- function(n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, gamma3, 
-                          gamma4, gamma5, gamma6, tau, schemes, proportions){
+                          gamma4, gamma5, gamma6, tau, schemes, proportions, nimputations){
   # Simulates one instance of the simulation, obtaining estimates for beta1 under various weighting
   # IIW uses stabilized weights
   
   
   # get required data from the data gen function 
-  singlerun <- gendata_IIW(n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, gamma3, gamma4, gamma5, gamma6, tau)
-  simdata_full <- singlerun$simdata_full #this is the censored data, but shows data at each 0.01 increment (times at which X and Y are actualy
-  #observed are indicated with observed = 1 in the dataset)
-  simdata_observed <- singlerun$simdata_Yobserved
+  singlerun <- gendata_IIW_binary(n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, gamma3, gamma4, gamma5, gamma6, tau)
+  simdata_full <- singlerun$simdata_full #counterfactual but censored data. Has Y even if not observed. (used for intensity model)
+  
+  simdata_observed <- singlerun$simdata_Yobserved # only data that is observed at observation times (used for outcome model)
   numevents <- singlerun$numevents
   newn <- singlerun$newn
   
+  # terti<-quantile(0:tau , c(0.3333, 0.66666), type = 1) 
+  terti<-quantile(0:tau , c(0.5), type = 1) 
   
   # need a function that imputes the missingness mechanism (MCAR< MAR,  etc, and a proportion of missingness. It also 
   # applies all 8 imputation methods)
   
-  betamat <- data.frame(matrix(NA, nrow = 1, ncol = 5*((length(schemes)-3)*length(proportions)+1) + 2))
+  betamat <- data.frame(matrix(NA, nrow = 1, ncol = 4*((length(schemes)-3)*length(proportions)+1) + 2))
   schemeno = 1
   schemenames <- c()
   
@@ -494,10 +615,13 @@ simulateOneIIW<- function(n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, 
       
       schemenames <- c(schemenames, scheme)
  
-      beta1_naive <- summary(glm(y ~ D + offset(2-times) - 1, data=simdata_observed))$coef[1,1]
+      beta1_naive <- summary(geeglm(y ~ D + bs(simdata_observed$time,degree=3,knots=c(terti)), 
+                                    family = "binomial", data=simdata_observed, id = id))$coef[2,1]
       
       betamat[1, schemeno] <- beta1_naive
       schemeno = schemeno + 1
+      
+
       
     }else if(scheme == "NoMissingness"){
       
@@ -505,8 +629,8 @@ simulateOneIIW<- function(n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, 
       
       schemenames <- c(schemenames, scheme)
       
-      intensitydata <- makeMissing(simdata_full, scheme = scheme, p = p)
-      intensitydata <- intensitydata[ , c(1:8, 19)] #intensity data only includes id, times, Z, Yobserved indicator
+      intensitydata <- makeMissing(simdata_full, scheme = scheme, p)
+      intensitydata <- intensitydata[ , c(1:8,22, 23)] #data only includes id, times, Z, Yobserved indicator,
       
       #include a variable counting observation number, to be used for lagging time for Surv function
       intensitydata$obsnumber <- with(intensitydata, ave(id, id, FUN = seq_along))
@@ -524,7 +648,9 @@ simulateOneIIW<- function(n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, 
         exp(cbind(simdata_observed$D, simdata_observed$V1t, simdata_observed$V2t, simdata_observed$V3t, simdata_observed$V4t, 
                   simdata_observed$V5t)%*%gamma.hat)
       
-      beta1_nm <- summary(glm(y ~ D + offset(2-times) - 1, data=simdata_observed, weights = iiw))$coef[1,1]
+      beta1_nm <- summary(geeglm(y ~ D + bs(simdata_observed$time,degree=3,knots=c(terti)), 
+                                 family = "binomial", data=simdata_observed, id = id,
+                                 weights = iiw))$coef[2,1]
       
       betamat[1, schemeno] <- beta1_nm
       
@@ -540,30 +666,31 @@ simulateOneIIW<- function(n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, 
 
         #invoke missingness
         intensitydata <- makeMissing(simdata_full, scheme = scheme, p = p)
-        intensitydata <- intensitydata[, c(1:8, 19)] #intensity data only includes id, times, Z,  y (for MNAR), Yobserved indicator
+        intensitydata <- intensitydata[, c(1:8, 22)] #for now, don't use Y in the imputation model (19)
+        #intensity data only includes id, times, Z,  y (for MNAR), Yobserved indicator
         
         
         #### impute data using the different methods
         betavec <- c(betavec, CCA(intensitydata, simdata_observed), 
                      LOCF(intensitydata, simdata_observed), SI(intensitydata, simdata_observed),
-                     MI(intensitydata, simdata_observed), NIRF(intensitydata, simdata_observed))
+                     MI(intensitydata, simdata_observed, nimputations)) #NIRF(intensitydata, simdata_observed))
         
         
         if(scheme == "ObsTimesOnly"){
           schemenames <- c(schemenames, c(paste(scheme, "CCA", sep = "_"), 
                           paste(scheme, "LOCF", sep = "_"), paste(scheme, "SI", sep = "_"),
-                          paste(scheme, "MI", sep = "_"), paste(scheme, "NIRF", sep = "_")))
+                          paste(scheme, "MI", sep = "_")))#, paste(scheme, "NIRF", sep = "_")))
         }else{
           schemenames <- c(schemenames, c(paste(scheme, p, "CCA", sep = "_"), 
                           paste(scheme, p, "LOCF", sep = "_"), paste(scheme, p, "SI", sep = "_"),
-                          paste(scheme, p, "MI", sep = "_"), paste(scheme, p, "NIRF", sep = "_")))
+                          paste(scheme, p, "MI", sep = "_")))#, paste(scheme, p, "NIRF", sep = "_")))
         }
         
         
         
-        betamat[1, schemeno:(schemeno+4)] <- betavec
+        betamat[1, schemeno:(schemeno+3)] <- betavec
         
-        schemeno = schemeno + 5
+        schemeno = schemeno + 4
         
         if(scheme == "ObsTimesOnly"){
           break
@@ -586,7 +713,7 @@ simulateOneIIW<- function(n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, 
 
 
 simulateResultsIIW<-  function(N, n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, gamma3, 
-                               gamma4, gamma5, gamma6, tau, schemes, proportions,
+                               gamma4, gamma5, gamma6, tau, schemes, proportions, nimputations,
                                outputfulldatalist = FALSE, inParallel, nclusters = NULL){
 
   # Simulates N instances of the each scheme
@@ -599,9 +726,9 @@ simulateResultsIIW<-  function(N, n, beta1, beta2, beta3, beta4, beta5, gamma1, 
   results_beta1 <- matrix(data = NA, nrow = N, ncol = nschemes)
 
     for(i in 1:N){
-      if(i%%1 == 0){print(i)}
+      if(i%%100 == 0){print(i)}
       simrun <- simulateOneIIW(n, beta1, beta2, beta3, beta4, beta5, gamma1, gamma2, gamma3, gamma4,
-                               gamma5, gamma6, tau, schemes, proportions)
+                               gamma5, gamma6, tau, schemes, proportions, nimputations)
       results_beta1[i, ] <- as.matrix(simrun$betamat)
     }
   
@@ -618,8 +745,13 @@ simulateResultsIIW<-  function(N, n, beta1, beta2, beta3, beta4, beta5, gamma1, 
 
   mse_beta1 <- round(apply((results_beta1 - beta1)^2, FUN = mean, MARGIN = 2), 3)
   names(mse_beta1) <- simrun$schemenames
+  
 
+  out <- list(bias_beta1, var_beta1, mse_beta1, results_beta1)
+  names(out) <- c("biasmat", "varmat", "msemat", "fullresults")
+  
 
+  return(out)
 # 
 #   ## ## ##
 # 
@@ -649,84 +781,19 @@ simulateResultsIIW<-  function(N, n, beta1, beta2, beta3, beta4, beta5, gamma1, 
 #   return(out)
 
 }
-# 
-# 
-# 
-# simulateALLFIPTIW_bd <- function(N, n, beta1, beta2, beta3, gamma1, gamma2vec, gamma3vec, 
-#                                  alpha0, alpha1vec, tau, outputfulldatalist = FALSE, censinform = F, 
-#                                  eta1 = NULL, eta2 = NULL, eta3 = NULL, 
-#                                  inParallel = T, nclusters = NULL){
-#   #N: number of simulation runs
-#   #n: vector of sample sizes
-#   #beta1: coefficient for Xi(t) in logistic outcome model
-#   #beta2: vector of coefficients to consider for outcome generation model
-#   #gamma1, gamma2 parameters for intensity for Xi(t) and Zi, respectively
-#   #tau: maximum follow-up time
-#   #inParallel: runs in parallel with nclusters if true
-#   
-#   #This function aggregates simulation results for varying n and beta2
-#   
-#   
-#   
-#   resultsmat <- matrix(NA, nrow = 1, ncol = 15)
-#   fulldatalist <- list()
-#   fulldatalistnames <- c()
-#   
-#   i = 1
-#   
-#   
-#   for(gamma2 in gamma2vec){
-#     for(gamma3 in gamma3vec){
-#       for(alpha1 in alpha1vec){
-#         
-#         
-#         print(paste("Now on gamma2 = ", gamma2, ", gamma3 =", gamma3, ", alpha1 =  ", alpha1, sep = ""))
-#         result <- simulateResultsFIPTIW_bd(N, n, beta1, beta2, beta3, gamma1, gamma2, gamma3, 
-#                                            alpha0, alpha1, tau,timevarD, outputfulldatalist, inParallel, nclusters)
-#         
-#         resultsmat <- rbind(resultsmat, c(gamma2,  gamma3, alpha1,
-#                                           result$naive_beta1, result$IIW_beta1, 
-#                                           result$IPW_beta1, result$FIPTIW_beta1))
-#         
-#         # resultsmat_stabilized <- rbind(resultsmat_stabilized, c(gamma2,  gamma3, alpha1,
-#         #                                                         result$naive_beta1, result$IIWstab_beta1, 
-#         #                                                         result$IPWstab_beta1, result$FIPTIWstab_beta1))
-#         # 
-#         
-#         listname <- paste("fulldata_gamma2_",gamma2, "_gamma3_", gamma3, "_alpha1_", alpha1, sep = "")
-#         
-#         if(outputfulldatalist == TRUE){
-#           fulldatalist[[i]] <- result$fullresults_beta1
-#           fulldatalistnames <- c(fulldatalistnames, listname)
-#         }
-#         
-#         
-#         i <- i + 1
-#         
-#       }
-#     }
-#   }
-#   
-#   if(outputfulldatalist == TRUE){
-#     names(fulldatalist) <- fulldatalistnames
-#   }
-#   
-#   
-#   
-#   resultsmat<- resultsmat[-1,]
-#   # resultsmat_stabilized <- resultsmat_stabilized[-1,]
-#   
-#   colnames(resultsmat) <- c( "gamma2",  "gamma3", "alpha1", "Bias", "Var" , "MSE" , "Bias", "Var" , "MSE" , "Bias", "Var" , "MSE", "Bias", "Var" , "MSE" )
-#   # colnames(resultsmat_stabilized) <- c( "gamma2", "gamma3", "alpha1", "Bias", "Var" , "MSE" , "Bias", "Var" , "MSE" , "Bias", "Var" , "MSE", "Bias", "Var" , "MSE" )
-#   
-#   if(outputfulldatalist == TRUE){
-#     out <- list(resultsmat, fulldatalist)
-#     names(out) <- c("resultsmat", "fulldatalist")
-#   }else{
-#     out <- list(resultsmat)
-#     names(out) <- c("resultsmat")
-#   }
-#   
-#   return(out)
-# }
+
+
+
+
+cleanUpResults <- function(results, proportions, schemes, methods){
+  
+  #create a clean table
+  
+  nproportions <- length(proportions)
+  nschemes <- length(schemes)
+  nmethods <- length(methods)
+  
+  
+  
+}
 
