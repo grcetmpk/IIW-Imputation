@@ -30,6 +30,8 @@ gendata_IIW <- function(n, beta1, beta2, beta3, beta4, beta5, beta6, gamma1,
   
   # Simulates observation times using bernoulli draws with probabilities proportional 
   # to the intensity. assume the treatment is time-invariant and randomized
+  
+  # SCHEME A
   #
   # Simulates continuous outcome
   #
@@ -66,10 +68,15 @@ gendata_IIW <- function(n, beta1, beta2, beta3, beta4, beta5, beta6, gamma1,
     D <- rep(rbinom(1, 1, 0.5), length(disctimes))
     
     
+
     # generate observation times confounder (time varying) V1t ~ N( mu_V_D0, var_V_D0) if D(t) = 0 and 
     # N( mu_V_D1, var_V_D1) if D = 1
+      
+    V1t <- round(ifelse(D == 0, rnorm(length(disctimes), mu_V1_D0, sqrt(var_V1_D0)), 
+                          rnorm(length(disctimes), mu_V1_D1, sqrt(var_V1_D1))), 3)
+      
+
     
-    V1t <- round(ifelse(D == 0, rnorm(length(disctimes), mu_V1_D0, sqrt(var_V1_D0)), rnorm(length(disctimes), mu_V1_D1, sqrt(var_V1_D1))), 3)
     
     # generate V2 (which will be used in V2(t) = V2log(t)
     
@@ -111,6 +118,10 @@ gendata_IIW <- function(n, beta1, beta2, beta3, beta4, beta5, beta6, gamma1,
     colnames(simdata) <- c("id", "times", "D", "V1t", "V2t", "V3t", "V4t", "V5t", "censortime", "eta")
     
     # need conditional expectation and variance of Z | X
+    
+
+    
+
     
     simdata$cexp_V1_D <- ifelse(simdata$D == 0, mu_V1_D0, mu_V1_D1)
     simdata$cexp_V2_D <- ifelse(simdata$D == 0, 0.5, 1.5)
@@ -170,7 +181,7 @@ gendata_IIW <- function(n, beta1, beta2, beta3, beta4, beta5, beta6, gamma1,
   
   simdata$intensities <- simdata$eta*sqrt(simdata$times)/2*exp(gamma1*simdata$D + gamma2*simdata$V1t + gamma3*simdata$V2t +
                                                                  gamma4*simdata$V3t + gamma5*simdata$V4t + gamma6*simdata$V5t)
-  simdata$prObs <- ifelse(0.01*simdata$intensities > 1, 1, 0.01*simdata$intensities) #simdata$intensities/max(simdata$intensities)
+  simdata$prObs <- ifelse(0.05*simdata$intensities > 1, 1, 0.01*simdata$intensities) #simdata$intensities/max(simdata$intensities)
   simdata$Yobserved <- rbinom(nrow(simdata), 1, simdata$prObs)
   
   
@@ -200,20 +211,194 @@ gendata_IIW <- function(n, beta1, beta2, beta3, beta4, beta5, beta6, gamma1,
 
 
 
-makeMissing <- function(intensitydat, scheme, p, whichmissing){
+
+gendata_IIWB <- function(n, beta1, beta2, beta3, beta4, beta5, beta6, gamma1, 
+                        gamma2, gamma3, gamma4, gamma5, gamma6, tau, outcome){
+  
+  # Simulates observation times using bernoulli draws with probabilities proportional 
+  # to the intensity. assume the treatment is time-invariant and randomized
+  #
+  # Simulates continuous outcome
+  #
+  # n: number of subjects
+  # tau: maximum follow up
+  
+  
+  var_phi <- 0.25
+  var_epsilon <- 1
+  
+  
+  # generate subjects one by one and then combine
+  id <- 1
+  simdatafull <- data.frame(matrix(NA, ncol = 21))
+  colnames(simdatafull) <- c("id", "times", "D", "V1t", "V2t", "V3t", "V4t", "V5t", "censortime", "eta", "cexp_V1_D", "cexp_V2_D", 
+                             "cexp_V3_D", "cexp_V4_D", "cexp_V5_D", "cvar_V1_D", "cvar_V2_D", 
+                             "cvar_V3_D", "cvar_V4_D", "cvar_V5_D", "y")
+  
+  
+  disctimes <- seq(0, tau, by = 0.01)
+  
+  while(id <= n){
+    
+    ## Generate Covariates
+    
+    ## Generate baseline covariate
+    
+    # generate treatment assignment (time-invariant) at each time point
+    D <- rep(rbinom(1, 1, 0.5), length(disctimes))
+    
+    
+
+    V1t <- round(ifelse(D == 0, rnorm(1, 0, sqrt(0.5)), 
+                          rnorm(1, 2, sqrt(0.5))), 3)*disctimes/3
+ 
+    
+    
+    # generate V2(t) (time varying)
+    
+    V2t <- round(ifelse(D == 0, runif(length(disctimes), 0, 1), runif(length(disctimes), 1, 2)), 3)*log(disctimes + 1)/2
+    
+    
+    # generate V3(t) , timeinvar
+    
+    V3t <- ifelse(D == 0, rbinom(length(disctimes), 1, 0.2), rbinom(length(disctimes), 1, 0.7))
+
+    
+    # generate V4(t), time-invariant
+    
+    V4t <- round(ifelse(D == 0, runif(1, 0.5, 2), 
+                        runif(1, 1.5, 3)), 3)*(disctimes-1)/3
+    
+    
+    # generate V5, time-var
+    
+    V5t <- ifelse(D == 0, rbinom(length(disctimes), 1, 0.8), rbinom(length(disctimes), 1, 0.4))
+    
+    # generate random effect
+    phi <- rnorm(1, 0, var_phi)
+    
+    censortime <- runif(1, tau/2, tau)
+  
+    
+    # calculate eta
+    eta <- rgamma(1, shape = 100, scale = 0.01) #eta is for random effect with mean 1 and sd 0.1 
+    #(obs times within subject correlated if sd !0)
+    
+    simdata <- data.frame(rep(id, length(disctimes)), disctimes, D, V1t, V2t, V3t, V4t, V5t, 
+                          rep(censortime, length(disctimes)), rep(eta, length(disctimes)))
+    colnames(simdata) <- c("id", "times", "D", "V1t", "V2t", "V3t", "V4t", "V5t", "censortime", "eta")
+    
+    # need conditional expectation and variance of Z | X
+
+    
+    simdata$cexp_V1_D <- ifelse(simdata$D == 0, 0, 2)*simdata$times/3
+    simdata$cexp_V2_D <- ifelse(simdata$D == 0, 0.5, 1.5)*log(simdata$times + 1)/2
+    simdata$cexp_V3_D <- ifelse(simdata$D == 0, 0.2, 0.7)
+    simdata$cexp_V4_D <- ifelse(simdata$D == 0, 2.5/2, 5.5/2)*(simdata$times-1)/3
+    simdata$cexp_V5_D <- ifelse(simdata$D == 0, 0.8, 0.4)
+    
+    simdata$cvar_V1_D <- 0.5*(simdata$times/3)^2
+    simdata$cvar_V2_D <- 1/12*(log(simdata$times + 1)/2)^2
+    simdata$cvar_V3_D <- ifelse(simdata$D == 0, 0.2*0.8, 0.2*0.7)
+    simdata$cvar_V4_D <- ifelse(simdata$D == 0, 1/12*(2 - 0.5)^2*((simdata$times-1)/3)^2, 1/12*(4 - 1.5)^2)*((simdata$times-1)/3)^2
+    simdata$cvar_V5_D <- ifelse(simdata$D == 0, 0.8*0.2, 0.4*0.6)
+    
+    if(outcome == "binary"){
+      M <- sqrt(beta2^2*simdata$cvar_V1_D + beta3^2*simdata$cvar_V2_D + beta4^2*simdata$cvar_V3_D + 
+                  beta5^2*simdata$cvar_V4_D + beta6^2*simdata$cvar_V5_D + var_epsilon + var_phi)/1.7
+      
+      fstar <- (2-simdata$times)*M - beta2*simdata$cexp_V1_D - beta3*simdata$cexp_V2_D - 
+        beta4*simdata$cexp_V3_D - beta5*simdata$cexp_V4_D - beta6*simdata$cexp_V5_D
+      
+      
+      
+      # generate time-varying outcome at each possible time
+      simdata$y <- ifelse(fstar + beta1*M*simdata$D + beta2*simdata$V1t + beta3*simdata$V2t + 
+                            beta4*simdata$V3t + beta5*simdata$V4t + beta6*simdata$V5t + rep(phi, dim(simdata)[1]) + 
+                            rnorm(dim(simdata)[1], 0, sqrt(var_epsilon)) > 0, 1, 0)
+      
+    }else if (outcome == "continuous"){
+      
+      simdata$y <- round((2 - simdata$times) + beta1*simdata$D + beta2*(simdata$V1 - simdata$cexp_V1_D) +
+                           beta3*(simdata$V2 - simdata$cexp_V2_D) + beta4*(simdata$V3 - simdata$cexp_V3_D) + beta5*(simdata$V4 - simdata$cexp_V4_D)+
+                           + beta6*(simdata$V5 - simdata$cexp_V5_D)+ rep(phi, dim(simdata)[1]) + 
+                           rnorm(dim(simdata)[1], 0, sqrt(var_epsilon)),3)
+      
+      
+    }else{
+      return(print(paste("incorrect type of outcome providedd")))
+    }
+    
+    
+    simdatafull <- rbind(simdatafull, simdata)
+    
+    
+    
+    
+    id = id + 1
+    
+  }
+  
+  
+  
+  
+  simdata <- simdatafull[-1,] #remove empty first row
+  
+  ### calculate intensities for each counterfactual observation time:
+  
+  
+  simdata$intensities <- simdata$eta*sqrt(simdata$times)/2*exp(gamma1*simdata$D + gamma2*simdata$V1t + gamma3*simdata$V2t +
+                                                                 gamma4*simdata$V3t + gamma5*simdata$V4t + gamma6*simdata$V5t)
+  simdata$prObs <- ifelse(0.01*simdata$intensities > 1, 1, 0.01*simdata$intensities) #simdata$intensities/max(simdata$intensities)
+  simdata$Yobserved <- rbinom(nrow(simdata), 1, simdata$prObs)
+  
+
+  # simdata <- simdata %>%
+  #   filter(times < censortime)
+  
+  
+  ### filter censored observations, unobserved observations (do this before or after calculating maximum intensity???)
+  simdata_observed <- simdata %>%
+    filter(Yobserved == 1) %>%
+    select(id, times, V1t, V2t, V3t, V4t, V5t, D, y, Yobserved)
+  
+  
+  #check the generated data
+  numevents <- summary(tapply(simdata_observed$Yobserved, simdata_observed$id, sum)) 
+  
+  
+  # #also get data for individuals at baseline (all same here)
+  newn <- length(unique(simdata_observed$id)) #number of people after censoring etc
+  
+  out <- list(simdata, simdata_observed, numevents, newn)
+  names(out) <- c("simdata_full", "simdata_Yobserved", "numevents", "newn")
+  
+  return(out) 
+  
+}
+
+
+
+
+
+
+
+
+
+makeMissing <- function(intensitydat, missingnesstype, p, whichmissing){
   
   
   # We are going to assume one additional covariate (V5t) is always known to impose MAR
   
 
-  if(scheme == "NoMissingness"){
+  if(missingnesstype == "NoMissingness"){
     
     intensitydat$Zobserved <- 1
     intensitydat <- intensitydat %>% select(id, times, D, V1t, V2t, V3t, V4t, V5t, y, Zobserved, Yobserved)
     
     return(intensitydat) # return full dataset with no missingness
     
-    }else if(scheme %in% c("ObsTimesOnly", "Naive")){
+    }else if(missingnesstype %in% c("ObsTimesOnly", "Naive")){
       
       #special case of MNAR, any V that can be misisng is only known when Y is 
       
@@ -241,7 +426,7 @@ makeMissing <- function(intensitydat, scheme, p, whichmissing){
       
       return(intensitydat)
       
-    }else if(scheme == "MCAR"){
+    }else if(missingnesstype == "MCAR"){
       # randomly select p% of observations to be missing
 
       intensitydat$Zobserved <- rbinom(dim(intensitydat)[1], 1, 1 - p) 
@@ -268,7 +453,7 @@ makeMissing <- function(intensitydat, scheme, p, whichmissing){
       
       return(intensitydat)
       
-    }else if(scheme == "MAR"){
+    }else if(missingnesstype == "MAR"){
       
       #missingness dependent on fully observed D and V5t
       
@@ -316,7 +501,7 @@ makeMissing <- function(intensitydat, scheme, p, whichmissing){
       
       return(intensitydat)
     
-    }else if(scheme == "MNAR"){
+    }else if(missingnesstype == "MNAR"){
       
       #missingness dependent on V4t, which is not fully observed
       
@@ -436,7 +621,7 @@ LOCF <- function(intensitydat, obsdat, outcome, usesplines){
   }
   
   
-SI <- function(intensitydat, obsdat, outcome, usesplines, scheme){
+SI <- function(intensitydat, obsdat, outcome, usesplines, missingnesstype){
  #regression switching imputation with PPM
   
   # only use observed Z covariates (D, V1t - v5t) for imputation
@@ -601,15 +786,20 @@ fitOutcomeModel <- function(obsdat, outcome, usesplines, terti, iiwweights = NUL
 
 
 simulateOneIIW<- function(n, beta1, beta2, beta3, beta4, beta5, beta6, gamma1, gamma2, gamma3, 
-                          gamma4, gamma5, gamma6, tau, schemes, proportions, whichmissing, nimputations, 
-                          outcome, usesplines){
+                          gamma4, gamma5, gamma6, tau, missingnesstypes, proportions, whichmissing, nimputations, 
+                          outcome, usesplines, scheme){
   # Simulates one instance of the simulation, obtaining estimates for beta1 under various weighting
   # IIW uses stabilized weights
   
-  
-  # get required data from the data gen function 
-  singlerun <- gendata_IIW(n, beta1, beta2, beta3, beta4, beta5, beta6,
-                           gamma1, gamma2, gamma3, gamma4, gamma5, gamma6, tau, outcome)
+  if(scheme == "A"){
+    # get required data from the data gen function 
+    singlerun <- gendata_IIW(n, beta1, beta2, beta3, beta4, beta5, beta6,
+                             gamma1, gamma2, gamma3, gamma4, gamma5, gamma6, tau, outcome)
+  }else{
+    singlerun <- gendata_IIWB(n, beta1, beta2, beta3, beta4, beta5, beta6,
+                             gamma1, gamma2, gamma3, gamma4, gamma5, gamma6, tau, outcome)
+  }
+
   
   simdata_full <- singlerun$simdata_full #counterfactual but censored data. Has Y even if not observed. (used for intensity model)
   
@@ -624,42 +814,42 @@ simulateOneIIW<- function(n, beta1, beta2, beta3, beta4, beta5, beta6, gamma1, g
   # need a function that imputes the missingness mechanism (MCAR< MAR,  etc, and a proportion of missingness. It also 
   # applies all 5 missing data methods)
 
-  betamat <- data.frame(matrix(NA, nrow = 1, ncol = 5*((length(schemes)-3)*length(proportions)+1) + 2))
-  semat <- data.frame(matrix(NA, nrow = 1, ncol = 5*((length(schemes)-3)*length(proportions)+1) + 2))
-  coveragemat <- data.frame(matrix(NA, nrow = 1, ncol = 5*((length(schemes)-3)*length(proportions)+1) + 2))
+  betamat <- data.frame(matrix(NA, nrow = 1, ncol = 5*((length(missingnesstypes)-3)*length(proportions)+1) + 2))
+  semat <- data.frame(matrix(NA, nrow = 1, ncol = 5*((length(missingnesstypes)-3)*length(proportions)+1) + 2))
+  coveragemat <- data.frame(matrix(NA, nrow = 1, ncol = 5*((length(missingnesstypes)-3)*length(proportions)+1) + 2))
 
   
-  schemeno = 1
-  schemenames <- c()
+  missingnesstypeno = 1
+  missingnesstypenames <- c()
   
-  for(scheme in schemes){
+  for(missingnesstype in missingnesstypes){
     
-    if(scheme == "Naive"){
+    if(missingnesstype == "Naive"){
       
       #No IIW, no adjustments
       
-      schemenames <- c(schemenames, scheme)
+      missingnesstypenames <- c(missingnesstypenames, missingnesstype)
  
 
       beta1_naive_results <- fitOutcomeModel(simdata_observed, outcome, usesplines, terti, iiwweights = NULL)
       
       
-      betamat[1, schemeno] <- beta1_naive_results$beta1est
-      semat[1, schemeno] <- beta1_naive_results$se_beta1
-      coveragemat[1, schemeno] <- beta1_naive_results$beta1_covered
+      betamat[1, missingnesstypeno] <- beta1_naive_results$beta1est
+      semat[1, missingnesstypeno] <- beta1_naive_results$se_beta1
+      coveragemat[1, missingnesstypeno] <- beta1_naive_results$beta1_covered
       
-      schemeno = schemeno + 1
+      missingnesstypeno = missingnesstypeno + 1
       
 
 
       
-    }else if(scheme == "NoMissingness"){
+    }else if(missingnesstype == "NoMissingness"){
       
       #perform IIW, but not the adjustments for missingness since there is no missing data
       
-      schemenames <- c(schemenames, scheme)
+      missingnesstypenames <- c(missingnesstypenames, missingnesstype)
       
-      intensitydata <- makeMissing(simdata_full, scheme = scheme, p, whichmissing)
+      intensitydata <- makeMissing(simdata_full, missingnesstype = missingnesstype, p, whichmissing)
 
       
       #include a variable counting observation number, to be used for lagging time for Surv function
@@ -682,11 +872,11 @@ simulateOneIIW<- function(n, beta1, beta2, beta3, beta4, beta5, beta6, gamma1, g
       
       
     
-      betamat[1, schemeno] <- beta1_nm_results$beta1est
-      semat[1, schemeno] <- beta1_nm_results$se_beta1
-      coveragemat[1, schemeno] <- beta1_nm_results$beta1_covered
+      betamat[1, missingnesstypeno] <- beta1_nm_results$beta1est
+      semat[1, missingnesstypeno] <- beta1_nm_results$se_beta1
+      coveragemat[1, missingnesstypeno] <- beta1_nm_results$beta1_covered
       
-      schemeno = schemeno + 1
+      missingnesstypeno = missingnesstypeno + 1
       
       
     }else{
@@ -694,12 +884,12 @@ simulateOneIIW<- function(n, beta1, beta2, beta3, beta4, beta5, beta6, gamma1, g
       
     for(p in proportions){
       
-        betavec <- c() #stores betas for each of the methods for a single scheme/proportion
+        betavec <- c() #stores betas for each of the methods for a single missingnesstype/proportion
         sevec <- c()
         coveragevec <- c()
 
         #invoke missingness
-        intensitydata <- makeMissing(simdata_full, scheme = scheme, p = p, whichmissing)
+        intensitydata <- makeMissing(simdata_full, missingnesstype = missingnesstype, p = p, whichmissing)
         
         
         #### impute data using the different methods
@@ -728,29 +918,29 @@ simulateOneIIW<- function(n, beta1, beta2, beta3, beta4, beta5, beta6, gamma1, g
                      NIRFresults$beta1_covered)
         
         
-        if(scheme == "ObsTimesOnly"){
-          schemenames <- c(schemenames, c(paste(scheme, "CCA", sep = "_"), paste(scheme, "LOCF", sep = "_"), 
-                                          paste(scheme, "SI", sep = "_"),
-                          paste(scheme, "MI", sep = "_"), paste(scheme, "NIRF", sep = "_")))
+        if(missingnesstype == "ObsTimesOnly"){
+          missingnesstypenames <- c(missingnesstypenames, c(paste(missingnesstype, "CCA", sep = "_"), paste(missingnesstype, "LOCF", sep = "_"), 
+                                          paste(missingnesstype, "SI", sep = "_"),
+                          paste(missingnesstype, "MI", sep = "_"), paste(missingnesstype, "NIRF", sep = "_")))
         }else{
-          schemenames <- c(schemenames, c(paste(scheme, p, "CCA", sep = "_"), 
-                                          paste(scheme, p, "LOCF", sep = "_"), 
-                                          paste(scheme, p, "SI", sep = "_"),
-                          paste(scheme, p, "MI", sep = "_"), paste(scheme, p, "NIRF", sep = "_")))
+          missingnesstypenames <- c(missingnesstypenames, c(paste(missingnesstype, p, "CCA", sep = "_"), 
+                                          paste(missingnesstype, p, "LOCF", sep = "_"), 
+                                          paste(missingnesstype, p, "SI", sep = "_"),
+                          paste(missingnesstype, p, "MI", sep = "_"), paste(missingnesstype, p, "NIRF", sep = "_")))
         }
         
         
         
-        betamat[1, schemeno:(schemeno+4)] <- betavec
-        semat[1, schemeno:(schemeno+4)] <- sevec
-        coveragemat[1, schemeno:(schemeno+4)] <- coveragevec
+        betamat[1, missingnesstypeno:(missingnesstypeno+4)] <- betavec
+        semat[1, missingnesstypeno:(missingnesstypeno+4)] <- sevec
+        coveragemat[1, missingnesstypeno:(missingnesstypeno+4)] <- coveragevec
 
-        schemeno = schemeno + 5
+        missingnesstypeno = missingnesstypeno + 5
         
         
 
         
-        if(scheme == "ObsTimesOnly"){
+        if(missingnesstype == "ObsTimesOnly"){
           break
         }
       }
@@ -759,10 +949,10 @@ simulateOneIIW<- function(n, beta1, beta2, beta3, beta4, beta5, beta6, gamma1, g
   
 
   
-  colnames(betamat) <- schemenames
+  colnames(betamat) <- missingnesstypenames
   
-  out <- list(betamat, semat, coveragemat, schemenames, simdata_full, numevents, newn)
-  names(out) <- c("betamat", "semat", "coveragemat", "schemenames", "simdata_full", "numevents", "newn")
+  out <- list(betamat, semat, coveragemat, missingnesstypenames, simdata_full, numevents, newn)
+  names(out) <- c("betamat", "semat", "coveragemat", "missingnesstypenames", "simdata_full", "numevents", "newn")
   
   
   return(out)
@@ -775,14 +965,14 @@ comb <- function(...){
 }
 
 simulateResultsIIW <- function(N, n, beta1, beta2, beta3, beta4, beta5, beta6, gamma1, gamma2, gamma3, 
-                               gamma4, gamma5, gamma6, tau, schemes, proportions, whichmissing, nimputations, 
-                               outcome, usesplines,
+                               gamma4, gamma5, gamma6, tau, missingnesstypes, proportions, whichmissing, nimputations, 
+                               outcome, usesplines, scheme,
                                outputfulldatalist = T, nclusters = 2){
-  # Simulates N instances of the each scheme
+  # Simulates N instances of the each missingnesstype
   # computes in parallel if inParallel = T
   #
 
-  nschemes <- 5*((length(schemes)-3)*length(proportions)+1) + 2
+  nmissingnesstypes <- 5*((length(missingnesstypes)-3)*length(proportions)+1) + 2
 
 
   registerDoParallel(nclusters)
@@ -790,21 +980,21 @@ simulateResultsIIW <- function(N, n, beta1, beta2, beta3, beta4, beta5, beta6, g
   results_beta1<- foreach(i = 1:N, .combine = comb, .export = c("expit", "simulateOneIIW",
                                                      "geeglm", "coxph", "Surv", "makeMissing", "CCA", "LOCF",
                                                       "SI", "MI", "NIRF", "IIW",
-                                                     "gendata_IIW", "bs", "fitOutcomeModel"
+                                                     "gendata_IIW", "gendata_IIWB", "bs", "fitOutcomeModel"
                                                              ),
                .packages = c("dplyr", "geepack", "mice", "missForest", "splines", "parallel")) %dopar% {
                simrun <- simulateOneIIW(n, beta1, beta2, beta3, beta4, beta5, beta6, gamma1, gamma2, gamma3, gamma4,
-                                        gamma5, gamma6, tau, schemes, proportions, whichmissing, nimputations,
-                                        outcome, usesplines)
+                                        gamma5, gamma6, tau, missingnesstypes, proportions, whichmissing, nimputations,
+                                        outcome, usesplines, scheme)
 
                betamat <- as.matrix(simrun$betamat)
-               colnames(betamat) <- simrun$schemenames
+               colnames(betamat) <- simrun$missingnesstypenames
                
                semat <- as.matrix(simrun$semat)
-               colnames(semat) <- simrun$schemenames
+               colnames(semat) <- simrun$missingnesstypenames
                
                coveragemat <- as.matrix(simrun$coveragemat)
-               colnames(coveragemat) <- simrun$schemenames
+               colnames(coveragemat) <- simrun$missingnesstypenames
                
                nobsmat <- as.matrix(t(as.numeric(simrun$numevents)))
                colnames(nobsmat) <- c("Min", "Q1", "Med", "Mean", "Q3", "Max")
@@ -899,51 +1089,44 @@ simulateResultsIIW <- function(N, n, beta1, beta2, beta3, beta4, beta5, beta6, g
     
   }
   
-  
-
-
-
- 
 
   return(out)
-
-
 }
 
 
 
 
-cleanUpResults <- function(resultsmat, proportions, schemes, methodnames){
+cleanUpResults <- function(resultsmat, proportions, missingnesstypes, methodnames){
   
   #create a clean table
   
   nproportions <- length(proportions)
-  nschemes <- length(schemes)
+  nmissingnesstypes <- length(missingnesstypes)
   nmethods <- length(methodnames)
   
 
    ######## ANY MAT ################################
 
-   outmat <- matrix(NA, nrow = (nschemes-3)*nproportions + 3, ncol = 2 + nmethods)
+   outmat <- matrix(NA, nrow = (nmissingnesstypes-3)*nproportions + 3, ncol = 2 + nmethods)
    colnames(outmat) <- c("Missingness Mechanism", "pmiss", methodnames)
    outmat[1,] <- c("No IIW/Naive", "-", resultsmat[1], "-", "-", "-", "-")
    outmat[2,] <- c("No Missingness", 0, resultsmat[2], "-", "-", "-", "-")
 
    #Obstimesonly
-   outmat[3,] <- c(schemes[3], "-", resultsmat[3:7])
+   outmat[3,] <- c(missingnesstypes[3], "-", resultsmat[3:7])
 
    #MCAR
-   outmat[4,] <- c(schemes[4], proportions[1], resultsmat[8:12])
+   outmat[4,] <- c(missingnesstypes[4], proportions[1], resultsmat[8:12])
    outmat[5,] <- c("", proportions[2], resultsmat[13:17])
    outmat[6,] <- c("", proportions[3], resultsmat[18:22])
 
    #MAR
-   outmat[7,] <- c(schemes[5], proportions[1], resultsmat[23:27])
+   outmat[7,] <- c(missingnesstypes[5], proportions[1], resultsmat[23:27])
    outmat[8,] <- c("", proportions[2], resultsmat[28:32])
    outmat[9,] <- c("", proportions[3], resultsmat[33:37])
 
    #MNAR
-   outmat[10,] <- c(schemes[6], proportions[1], resultsmat[38:42])
+   outmat[10,] <- c(missingnesstypes[6], proportions[1], resultsmat[38:42])
    outmat[11,] <- c("", proportions[2], resultsmat[43:47])
    outmat[12,] <- c("", proportions[3], resultsmat[48:52])
 

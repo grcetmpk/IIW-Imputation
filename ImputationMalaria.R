@@ -1,0 +1,601 @@
+require(data.table)
+require(dplyr)
+require(tidyr)
+require(splines)
+require(survey)
+require(knitr)
+require(kableExtra)
+require(geepack)
+require(ggplot2)
+require(mice)
+require(NNMIS)
+
+expit <- function(x){ return(exp(x)/(1+exp(x)))}
+
+### ~~~~~~~ Data Importation ~~~~~ ###
+
+### import patient level data
+participant_baseline_data <- fread("PRISMdata/PRISM_cohort_Participants.txt")
+names(participant_baseline_data) <-  gsub(" ", "_", gsub("\\[|\\]", "", 
+                                                         names(participant_baseline_data)))
+### import patient repeated measures data
+participant_repeated_data <- fread("PRISMdata/PRISM_cohort_Participant_repeated_measures.txt")
+names(participant_repeated_data) <-  gsub(" ", "_", gsub("\\[|\\]", "",
+                                                         names(participant_repeated_data)))
+### import household level data
+household_baseline_data <- fread("PRISMdata/PRISM_cohort_Households.txt")
+names(household_baseline_data) <-  gsub(" ", "_", gsub("\\[|\\]", "", 
+                                                       names(household_baseline_data)))
+### import household repeated data
+household_repeated_data <- fread("PRISMdata/PRISM_cohort_Household_repeated_measures.txt")
+names(household_repeated_data) <-  gsub(" ", "_", gsub("\\[|\\]", "",
+                                                       names(household_repeated_data)))
+
+
+
+#~~~~ Create single data frame, one row for each patient, inc household data ~~~~~~~~#
+
+
+#remove columns we don't need
+participant_baseline_data <- participant_baseline_data[, c(1,2,3,9,13,14,15)]
+participant_repeated_data <- participant_repeated_data[, c(1,2,3,4,8,11,24,31,36,45,48)]
+household_baseline_data <- household_baseline_data[, c(1,17, 18, 22, 23, 24, 25, 32, 39)]
+
+
+
+#### first join together the participant and household baseline data
+baseline_data <- participant_baseline_data %>% 
+  left_join(household_baseline_data, by = "Household_Id") # add in time-invar household information
+
+
+### sort time-varying data by participant_id and then time
+participant_repeated_data <- participant_repeated_data %>% 
+  arrange(Participant_Id, `Time_since_enrollment_(days)_EUPATH_0000191`)
+
+
+### merge so we have repeated and time-invariant data
+data_children <- participant_repeated_data %>% 
+  left_join(baseline_data, by = "Participant_Id") %>% 
+  arrange(Participant_Id) %>% # sort by ID
+  filter(`Age_at_enrollment_(years)_EUPATH_0000120` >= 2) %>% # remove those who were younger than 2 or
+  filter(`Age_at_enrollment_(years)_EUPATH_0000120` <= 11) %>% # older than 11 at initial visit
+  # filter(`Reason_for_withdrawal_EUPATH_0000208` %in% c("Moved out of area", "Completed study" )) %>% # ind censoring
+  filter(`Age_(years)_OBI_0001169` <= 11, `Age_(years)_OBI_0001169` >= 2) %>%# filter by children between 2 and 11 y/o for entire duration
+  filter(`Observation_date_EUPATH_0004991` <= "2016-06-30") %>% #remove obs after june 30 2016
+  filter(`Drinking_water_source_ENVO_00003064` %in% c("Public tap", "Protected public well" , "River/stream",
+                                                      "Protected spring", "Borehole",  "Open public well",        
+                                                      "Pond/lake" , "Unprotected spring"  )) #remove piped water sources
+
+# ggplot(data_children, aes(x = `Time_since_enrollment_(days)_EUPATH_0000191`, y = Participant_Id)) + geom_point(size = 0.5)
+
+
+
+# combine two human waste categories together
+
+data_children$Human_waste_facilities_EUPATH_0000335[data_children$Human_waste_facilities_EUPATH_0000335 == 
+                                                      "[\"Uses neighbours\",\"No facility/bush/field\"]"] <- "[\"No facility/bush/field\"]"
+
+
+data_children$Antimalarial_medication_EUPATH_0000058 <- relevel(as.factor(data_children$Antimalarial_medication_EUPATH_0000058),
+                                                                ref = "No malaria medications given")
+
+### randomly sample one child per household
+
+length(unique(data_children$Household_Id.x)) # we have 133 unique households
+
+set.seed(100)
+
+participant_list <- c() #empty list to store participants (one per fam)
+hhlist <- tapply(data_children$Participant_Id, data_children$Household_Id.x, unique) #list of ids per family
+for(i in 1:length(hhlist)){
+  fam <- hhlist[[i]]
+  if(length(fam) > 1){
+    participant <- sample(fam, 1) # randomly sample one child from the family
+  }else{
+    participant <- fam 
+  }
+  
+  participant_list <- c(participant_list, participant) #add it to the list
+}
+
+data_children <- data_children %>% 
+  filter(Participant_Id %in% participant_list)
+
+length(participant_list)
+dim(data_children) #8681 x 25
+
+###### ~~~~~~~~~~~~~~administrative censoring.
+
+
+#### figure out last observation times for each individual
+data_children_lastobs <- do.call("rbind", 
+                                 by(data_children, INDICES=data_children$Participant_Id, 
+                                    FUN=function(data_children) data_children[which.max(data_children$`Time_since_enrollment_(days)_EUPATH_0000191`), ]))[,c(2,10, 15)]
+
+summary(data_children_lastobs[,2])
+quantile(unlist(data_children_lastobs[,2]), 0.05) #95% of individuals censoring time is after 191 days (basically 6 months)
+
+#figure out how many people had censoring times prior to 6 months
+propcensoredpriorto6months <- length(which(data_children_lastobs[,2] < 365/2))/dim(data_children_lastobs)[1] #0.0488
+propcensoredpriorto6months
+
+data_children_censored <- data_children_lastobs[which(data_children_lastobs[,2] < 365/2),] 
+
+prop_noninformative <- length(which(data_children_censored$Reason_for_withdrawal_EUPATH_0000208 %in% 
+                                      c("Completed study", "Moved out of area")))/dim(data_children_censored)[1] 
+prop_noninformative
+# of who were censored prior to 6 months, 71.43% of individuals were censored for reasons 
+# unrelated to the longitudinal outcome
+
+# this leaves 1.39% of individuals having informative censoring. Negligible. 
+(1-prop_noninformative)*propcensoredpriorto6months
+
+
+#artificially censor at one year to reduce the amount of censoring present in the data
+
+data_children <- data_children %>%
+  filter(`Time_since_enrollment_(days)_EUPATH_0000191` <= 365/2)
+
+ggplot(data_children, aes(x = `Time_since_enrollment_(days)_EUPATH_0000191`, y = Participant_Id)) + geom_point(size = 0.5)
+
+
+
+
+### calculate summary of number of events per individual
+data_children$Observed <- 1
+data_children$obsnumber <- with(data_children, ave(Participant_Id, Participant_Id, FUN = seq_along))
+
+
+data_children <- data_children %>% select(-c(`Weight_(kg)_IAO_0000414`,`Height_(cm)_EUPATH_0010075` ))
+
+
+
+numevents <- summary(tapply(data_children$Observed, data_children$Participant_Id, sum)) 
+numevents #min 1 mean 30.9 max 104.0
+dim(data_children) #1386 x 25
+length(unique(data_children$Participant_Id)) #287 
+table(data_children$Observation_type_BFO_0000015) # 287 enrollment, 525 sched, 574 unsched
+
+
+
+
+### find out how many obs and subjects have malaria diagnosis
+
+data_children_malaria <- data_children %>% filter(Malaria_diagnosis_EUPATH_0000090 == "Yes")
+dim(data_children_malaria) # 179/1386 (12.91%) of observations have malaria diagnosis at some point
+length(unique(data_children_malaria$Participant_Id)) # 111/287 (~38.68%) of patients had malaria at some point
+
+
+
+### Create indicator for Malaria diagnosis (1 if diagnosed)
+data_children$Malaria <- ifelse(data_children$Malaria_diagnosis_EUPATH_0000090 == "Yes", 1, 0)
+
+### Create indicator for whether treatment administered on previous visit
+data_children$obsnumber <- with(data_children, ave(Participant_Id, Participant_Id, FUN = seq_along))
+
+data_children$scheduled <- ifelse(data_children$Observation_type_BFO_0000015 == "Unscheduled visit", "No", "Yes")
+
+
+
+#### create variable of whether artmether-lumefantrine prescribed in last 3 days OR 
+#### quinine or artesunate in the last 7 days
+
+# go through each individual and get observations from last 3 and 7 days
+individuals <- unique(data_children$Participant_Id)
+
+trtwithinoneweek_full <- c()
+
+for(id in individuals){
+  
+  
+  individual_data <- data_children[data_children$Participant_Id == id, ]
+  observation_dates <- individual_data$Observation_date_EUPATH_0004991
+  observation_dates <- as.Date(observation_dates, format = "%Y-%m-%d")
+  
+  trtwithinoneweekvec <- c()
+  
+  for(i in 1:length(observation_dates)){
+    obsdate <- observation_dates[i]
+    
+    dayssince <- difftime(observation_dates, obsdate, units = "days")
+    withinoneweek <- which(dayssince > -7 & dayssince < 0)
+    
+    if(length(withinoneweek) == 0){
+      # if no obs within one week, then treated within a week is 0 for this date 
+      trtwithinoneweekvec <- c(trtwithinoneweekvec, 0)
+    } else { # if we have obs within one week, see what trt were given
+      data_withinoneweek <- individual_data[withinoneweek, ]
+      trts <- unique(data_withinoneweek$Antimalarial_medication_EUPATH_0000058)
+      
+      # see if quinine or artesunate was given
+      if( "Quinine or Artesunate for complicated malaria" %in% trts){
+        trtwithinoneweekvec <- c(trtwithinoneweekvec, 1)
+        
+      }else if("Quinine for uncomplicated malaria within 14 days of a previous treatment for malaria" %in% trts){
+        trtwithinoneweekvec <- c(trtwithinoneweekvec, 1)
+      }else{
+        trtwithinoneweekvec <- c(trtwithinoneweekvec, 0)
+      }
+      
+    }
+    
+    
+  }
+  trtwithinoneweek_full <- c(trtwithinoneweek_full, trtwithinoneweekvec)
+}
+
+#### no observations had antimalarials within one week of observation. 
+sum(trtwithinoneweek_full)
+
+
+# create a variable for protected water sources
+data_children$waternotprotected <- ifelse(data_children$Drinking_water_source_ENVO_00003064 %in% c("River/stream",   
+                                                                                                   "Open public well", "Pond/lake", "Unprotected spring"), 1, 0)
+
+
+data_children_baseline <- data_children[data_children$Observation_type_BFO_0000015 == "Enrollment", ]
+
+
+table(data_children_baseline$Sex_PATO_0000047) #145 female, 142 male 
+#no missingness :D
+
+
+# add covariate for time since last visit, current age, and disease status at last visit 
+# as this is time-varying, need to make sure we impute all of the data at "missing" times (days) ( 0.1 to 1775)
+
+potentialtimes <- c(seq(0, 365, by = 1)) #max observation time one year
+
+fullpotentialdata <- data.frame(matrix(NA, ncol = 28))
+colnames(fullpotentialdata) <- colnames(data_children)
+fullpotentialdata <- fullpotentialdata[, c(2,5,8,9,11,13,14,16,17,18,19,21,22,23,24,26,27,28)]
+fullpotentialdata$timesincelastvisit <- NA
+fullpotentialdata$currentage <- NA
+fullpotentialdata$lastmalariastatus <- NA
+
+for(id in unique(data_children$Participant_Id)){
+  observeddata_id <- data_children[which(data_children$Participant_Id == id), c(2,5,8,9,11,13,14,16,17,18,19,21,22,23,24,26,27,28)]
+  observedtimes_id <- observeddata_id$`Time_since_enrollment_(days)_EUPATH_0000191`
+  
+  emptydata_id <- data.frame(matrix(NA, ncol = dim(observeddata_id)[2] + 3))
+  colnames(emptydata_id) <- c(colnames(observeddata_id), "timesincelastvisit", "currentage", "lastmalariastatus")
+  
+  ageatenroll_id <- observeddata_id[1,2]
+  
+  lastvisittime_id <- 0
+  lastmalariastatus_id <- observeddata_id[1, 16]
+  
+  for(currenttime in potentialtimes){
+    
+    timesincelastvisit <- currenttime - lastvisittime_id
+    currentage <- ageatenroll_id + currenttime/365
+    
+    #if we have data for this time, use it 
+    if(currenttime %in% observedtimes_id){
+      
+      thisobs <- data.frame(c(observeddata_id[which(observeddata_id$`Time_since_enrollment_(days)_EUPATH_0000191` == currenttime), ], 
+                              timesincelastvisit, currentage, lastmalariastatus_id))
+      colnames(thisobs) <- c(colnames(observeddata_id), "timesincelastvisit", "currentage", "lastmalariastatus")
+      
+      emptydata_id <- rbind(emptydata_id, thisobs)
+      
+      lastvisittime_id <- currenttime #update last obs time
+      lastmalariastatus <- thisobs[1,16] #update last known malaria diagnosis
+      
+    } else {
+      
+      # if we don't have data for this time, impute it using the time-invariant data
+      
+      thisobs <- data.frame(c(observeddata_id[which(observeddata_id$`Time_since_enrollment_(days)_EUPATH_0000191` == 0), ], 
+                              timesincelastvisit, currentage, lastmalariastatus))
+      colnames(thisobs) <- c(colnames(observeddata_id), "timesincelastvisit", "currentage", "lastmalariastatus")
+      
+      thisobs[1, 4] <- currenttime #change time to current time
+      thisobs[1,15] <- 0 # change observed to 0
+      
+      emptydata_id <- rbind(emptydata_id, thisobs)
+      
+    }
+    
+    
+  }
+  
+  emptydata_id <- emptydata_id[-1, ]
+  
+  #add it to the larger dataset
+  fullpotentialdata <- rbind(fullpotentialdata, emptydata_id)
+  
+}
+
+fullpotentialdata <- fullpotentialdata[-1, ]
+
+
+#create dummy vars needed for intensity model
+fullpotentialdata$schedulednum <- ifelse(fullpotentialdata$scheduled == "Yes", 1, 0)
+fullpotentialdata$Male <- ifelse(fullpotentialdata$Sex_PATO_0000047 == "Male", 1, 0)
+fullpotentialdata$HWI_middle <- ifelse(fullpotentialdata$`Household_wealth_index,_categorical_EUPATH_0000143` == "Middle", 1, 0)
+fullpotentialdata$HWI_poorest <- ifelse(fullpotentialdata$`Household_wealth_index,_categorical_EUPATH_0000143` == "Poorest", 1, 0)
+fullpotentialdata$SC_Nagongera <- ifelse(fullpotentialdata$`Sub-county_in_Uganda_EUPATH_0000054` == "Nagongera", 1, 0)
+fullpotentialdata$SC_Walukuba   <- ifelse(fullpotentialdata$`Sub-county_in_Uganda_EUPATH_0000054` == "Walukuba", 1, 0)
+fullpotentialdata$FPW_Never <- ifelse(fullpotentialdata$Food_problems_per_week_EUPATH_0000029 == "Never", 1, 0)
+fullpotentialdata$FPW_Often <- ifelse(fullpotentialdata$Food_problems_per_week_EUPATH_0000029 == "Often", 1, 0)
+fullpotentialdata$FPW_Seldom <- ifelse(fullpotentialdata$Food_problems_per_week_EUPATH_0000029 == "Seldom", 1, 0)
+fullpotentialdata$FPW_Sometimes <- ifelse(fullpotentialdata$Food_problems_per_week_EUPATH_0000029 == "Sometimes", 1, 0)
+fullpotentialdata$HWF_CPLNS <- ifelse(fullpotentialdata$Human_waste_facilities_EUPATH_0000335 == "[\"Covered pit latrine no slab\"]", 1, 0)
+fullpotentialdata$HWF_CPLWS <- ifelse(fullpotentialdata$Human_waste_facilities_EUPATH_0000335 == "[\"Covered pit latrine w/slab\"]", 1, 0)
+fullpotentialdata$HWF_FT <- ifelse(fullpotentialdata$Human_waste_facilities_EUPATH_0000335 == "[\"Flush toilet\"]" , 1, 0)
+fullpotentialdata$HWF_NF <- ifelse(fullpotentialdata$Human_waste_facilities_EUPATH_0000335 == "[\"No facility/bush/field\"]" , 1, 0)
+fullpotentialdata$HWF_UPLNS <- ifelse(fullpotentialdata$Human_waste_facilities_EUPATH_0000335 %in% c("[\"Uncovered pit latrine no slab\"]", "[\"Uses neighbours\",\"No facility/bush/field\"]"), 1, 0)
+fullpotentialdata$HWF_UPLWS <- ifelse(fullpotentialdata$Human_waste_facilities_EUPATH_0000335 == "[\"Uncovered pit latrine w/slab\"]" , 1, 0)
+fullpotentialdata$HWF_VIP <- ifelse(fullpotentialdata$Human_waste_facilities_EUPATH_0000335 == "[\"Vip latrine\"]", 1, 0)
+fullpotentialdata$Dwellingtypenum <- ifelse(fullpotentialdata$Dwelling_type_ENVO_01000744 == "Traditional", 1, 0)
+
+
+#createdataframe of only observed data
+observed_potentialdata <- fullpotentialdata[which(fullpotentialdata$Observed == 1), ] #same as data_children but contains some time-varying covariates that 
+#were calculated when making the counterfactual data
+
+#we only know malaria status if observed
+fullpotentialdata <- fullpotentialdata[, -c(2, 5, 16)]
+
+
+
+###################################################################################################
+#########################################################################################################
+#########################################################################################################
+#########################################################################################################
+#########################################################################################################
+
+# in this section we are imposing missingness on Age, which we can calculate at each time point
+#########################################################################################################
+#########################################################################################################
+#########################################################################################################
+#########################################################################################################
+
+
+terti<-quantile(observed_potentialdata$`Time_since_enrollment_(days)_EUPATH_0000191` , c(0.3333, 0.66666), type = 1) 
+
+
+#########first, calculate results when no missingness is present
+
+iiwfun <- function(intensitydat){
+  
+  
+  #enumerate each observation per individual
+  intensitydat$obsnumber <- ave(seq_len(nrow(intensitydat)), intensitydat$Participant_Id, FUN = seq_along)
+  
+  
+  #calculate lags
+  
+  ### create lags (set t = 0 to 0.1)
+  intensitydat$`Time_since_enrollment_(days)_EUPATH_0000191` <- ifelse(intensitydat$`Time_since_enrollment_(days)_EUPATH_0000191` == 0, 0.1, 
+                                                                       intensitydat$`Time_since_enrollment_(days)_EUPATH_0000191`)
+  intensitydat$Time_lag <- intensitydat$`Time_since_enrollment_(days)_EUPATH_0000191`[c(nrow(intensitydat),1:(nrow(intensitydat)-1))]
+  intensitydat$Time_lag[intensitydat$obsnumber == 1] <- 0
+  
+  
+  
+  
+  # weight stabilizer, use full counterfactual data to est parameters
+  delta.hat <- coxph(Surv(Time_lag, `Time_since_enrollment_(days)_EUPATH_0000191`, Observed) ~ factor(Male) - 1, data = intensitydat)$coef
+  
+  # model with aux variables, use full data to est parameters
+  intensitymod <- coxph(Surv(Time_lag, `Time_since_enrollment_(days)_EUPATH_0000191`, Observed) ~ factor(Male) + currentage +
+                          `Sub-county_in_Uganda_EUPATH_0000054` + `Household_wealth_index,_categorical_EUPATH_0000143` +
+                          `Food_problems_per_week_EUPATH_0000029` + #Human_waste_facilities_EUPATH_0000335 +
+                          Dwelling_type_ENVO_01000744 + Persons_living_in_house_count_EUPATH_0000019 +
+                          lastmalariastatus - 1, 
+                        data = intensitydat)
+  
+  gamma.hat <- intensitymod$coef
+  
+  
+  
+  Z <- cbind(observed_potentialdata$Male, observed_potentialdata$currentage,
+             observed_potentialdata$SC_Nagongera, observed_potentialdata$SC_Walukuba,
+             observed_potentialdata$HWI_middle, observed_potentialdata$HWI_poorest,
+             observed_potentialdata$FPW_Never, observed_potentialdata$FPW_Often,
+             observed_potentialdata$FPW_Seldom, observed_potentialdata$FPW_Sometimes,
+             # observed_potentialdata$HWF_CPLNS, observed_potentialdata$HWF_CPLWS,
+             # observed_potentialdata$HWF_FT, observed_potentialdata$HWF_NF,
+             # observed_potentialdata$HWF_UPLNS, observed_potentialdata$HWF_CPLWS,
+             # observed_potentialdata$HWF_VIP,
+             observed_potentialdata$Dwellingtypenum,
+             observed_potentialdata$Persons_living_in_house_count_EUPATH_000001,
+             observed_potentialdata$lastmalariastatus)
+  
+  iiw <- exp(cbind(observed_potentialdata$Male)%*%delta.hat)/exp(Z%*%gamma.hat)
+  
+  
+  
+  
+  
+  finalmod_iiw <- glm(factor(Malaria) ~ factor(Male) + bs(observed_potentialdata$`Time_since_enrollment_(days)_EUPATH_0000191`, 
+                                                                       degree=3,knots=c(terti)), data=observed_potentialdata, 
+                      family=quasibinomial(link="logit"), weights = iiw)
+  ATE <- round(summary(finalmod_iiw)$coef[2,1],3)
+  SE <- round(summary(finalmod_iiw)$coef[2,2],3)
+  iiw_CI_ll <- round(ATE - 1.960*SE,3)
+  iiw_CI_ul <- round(ATE +1.960*SE,3)
+  iiw_CI_ll_OR <- round(exp(ATE - 1.960*SE), 3)
+  iiw_CI_ul_OR <- round(exp(ATE +1.960*SE), 3)
+  CI <- paste("(", iiw_CI_ll, ", ", iiw_CI_ul, ")", sep = "")
+  CI_OR <- paste("(", iiw_CI_ll_OR, ", ", iiw_CI_ul_OR, ")", sep = "")
+  
+  
+  
+  out <- list(ATE, SE, CI, round(exp(ATE),3), CI_OR)
+  names(out) <- c('ATE', 'SE', 'CI', 'OR', 'CI_OR')
+  return(out)
+}
+
+
+iiw_fulldata <- iiwfun(fullpotentialdata)
+iiw_fulldata
+
+
+
+
+
+
+
+###### Impose Missingness Not at Random ###########
+    
+  missingdata <- fullpotentialdata
+  missingdata$currentage <- ifelse(missingdata$Observed == 1, missingdata$currentage, NA)
+    
+
+
+
+########### impute the data using each of the five methods, then calulcate the iiw weights and betas
+###########
+  
+
+  
+##CCA
+
+intensitydat_CCA <- na.omit(missingdata)
+iiw_CCA <- iiwfun(intensitydat_CCA)
+iiw_CCA  
+  
+##LOCF
+
+#do LOCF
+intensitydat_LOCF <- missingdata %>%
+  group_by(Participant_Id) %>%
+  tidyr::fill(names(missingdata), .direction = "downup") %>%
+  ungroup()
+iiw_LOCF <- iiwfun(intensitydat_LOCF)
+iiw_LOCF
+
+
+
+
+##SI
+
+
+intensitydat_SI <- missingdata %>% select(Participant_Id, Observation_type_BFO_0000015, `Time_since_enrollment_(days)_EUPATH_0000191`, timesincelastvisit, 
+                                              Male, Drinking_water_source_ENVO_00003064, Dwelling_type_ENVO_01000744, 
+                                              Food_problems_per_week_EUPATH_0000029, `Household_wealth_index,_categorical_EUPATH_0000143`, Persons_living_in_house_count_EUPATH_0000019,
+                                              `Sub-county_in_Uganda_EUPATH_0000054`, Observed, scheduled, currentage, lastmalariastatus)
+
+
+imp <- mice::mice(intensitydat_SI, m = 1, maxit = 5, meth = "pmm", seed = 5, printFlag = F)
+intensitydat_SI <- complete(imp)
+
+iiw_SI <- iiwfun(intensitydat_SI)
+iiw_SI
+
+
+##MI #HERE
+
+#include a variable counting observation number, to be used for lagging time for Surv function
+
+intensitydat_MI <- missingdata
+
+#determine which covariates to use in the imputation model
+
+intensitydat_MI <- intensitydat_MI %>% select(Participant_Id, Observation_type_BFO_0000015, `Time_since_enrollment_(days)_EUPATH_0000191`, timesincelastvisit, 
+                                              Male, Drinking_water_source_ENVO_00003064, Dwelling_type_ENVO_01000744, 
+                                              Food_problems_per_week_EUPATH_0000029, `Household_wealth_index,_categorical_EUPATH_0000143`, Persons_living_in_house_count_EUPATH_0000019,
+                                              `Sub-county_in_Uganda_EUPATH_0000054`, Observed, scheduled, currentage, lastmalariastatus)
+
+
+imp <- mice::mice(intensitydat_MI, m = 5, maxit = 5, meth = "pmm", seed = 100, printFlag = F)
+
+
+
+##### perform IIW on the imputed data set
+
+
+# #create lagged time variable
+intensitydat_MI$obsnumber <- ave(seq_len(nrow(intensitydat_MI)), intensitydat_MI$Participant_Id, FUN = seq_along)
+intensitydat_MI$times.lag <- intensitydat_MI$times[c(nrow(intensitydat_MI ),1:(nrow(intensitydat_MI )-1))]
+intensitydat_MI$times.lag[intensitydat_MI$obsnumber == 1] <- -0.01
+
+
+delta.hat <- summary(pool(with(imp, coxph(Surv(times.lag, `Time_since_enrollment_(days)_EUPATH_0000191`, Observed) ~ 
+                                            factor(Male) - 1, data = intensitydat_MI))))[,2]
+gamma.hat <- summary(pool(with(imp,  coxph(Surv(times.lag, `Time_since_enrollment_(days)_EUPATH_0000191`, Observed) ~ factor(Male) + currentage +
+                                             `Sub-county_in_Uganda_EUPATH_0000054` + `Household_wealth_index,_categorical_EUPATH_0000143` +
+                                             `Food_problems_per_week_EUPATH_0000029` + #Human_waste_facilities_EUPATH_0000335 +
+                                             Dwelling_type_ENVO_01000744 + Persons_living_in_house_count_EUPATH_0000019 +
+                                             lastmalariastatus - 1, 
+                                           data = intensitydat_MI))))[,2]
+
+### perform IIW on the "observed" X and Y data
+
+
+
+Z <- cbind(observed_potentialdata$Male, observed_potentialdata$currentage,
+           observed_potentialdata$SC_Nagongera, observed_potentialdata$SC_Walukuba,
+           observed_potentialdata$HWI_middle, observed_potentialdata$HWI_poorest,
+           observed_potentialdata$FPW_Never, observed_potentialdata$FPW_Often,
+           observed_potentialdata$FPW_Seldom, observed_potentialdata$FPW_Sometimes,
+           # observed_potentialdata$HWF_CPLNS, observed_potentialdata$HWF_CPLWS,
+           # observed_potentialdata$HWF_FT, observed_potentialdata$HWF_NF,
+           # observed_potentialdata$HWF_UPLNS, observed_potentialdata$HWF_CPLWS,
+           # observed_potentialdata$HWF_VIP,
+           observed_potentialdata$Dwellingtypenum,
+           observed_potentialdata$Persons_living_in_house_count_EUPATH_000001,
+           observed_potentialdata$lastmalariastatus)
+
+iiw_MI <- exp(cbind(observed_potentialdata$Male)%*%delta.hat)/exp(Z%*%gamma.hat)
+
+
+
+mod_MI <- glm(factor(Malaria) ~ factor(Male) + bs(observed_potentialdata$`Time_since_enrollment_(days)_EUPATH_0000191`, 
+                                                                     degree=3,knots=c(terti)), data=observed_potentialdata, 
+                    family=quasibinomial(link="logit"), weights = iiw_MI)
+ATE_MI <- round(summary(mod_MI)$coef[2,1],3)
+SE_MI <- round(summary(mod_MI)$coef[2,2],3)
+OR_MI <- round(exp(ATE_MI),3)
+iiw_CI_ll_MI <- round(ATE_MI - 1.960*SE_MI,3)
+iiw_CI_ul_MI <- round(ATE_MI +1.960*SE_MI,3)
+iiw_CI_ll_OR_MI <- round(exp(ATE_MI - 1.960*SE_MI), 3)
+iiw_CI_ul_OR_MI <- round(exp(ATE_MI +1.960*SE_MI), 3)
+CI_MI <- paste("(", iiw_CI_ll_OR_MI, ", ", iiw_CI_ul_OR_MI, ")", sep = "")
+CI_OR_MI <- paste("(", iiw_CI_ll_OR_MI, ", ", iiw_CI_ul_OR_MI, ")", sep = "")
+
+
+
+
+
+##missFOrest
+
+intensitydat_MF <- missingdata %>% select(Participant_Id, Observation_type_BFO_0000015, `Time_since_enrollment_(days)_EUPATH_0000191`, timesincelastvisit, 
+                                              Male, Drinking_water_source_ENVO_00003064, Dwelling_type_ENVO_01000744, 
+                                              Food_problems_per_week_EUPATH_0000029, `Household_wealth_index,_categorical_EUPATH_0000143`, Persons_living_in_house_count_EUPATH_0000019,
+                                              `Sub-county_in_Uganda_EUPATH_0000054`, Observed, scheduled, currentage, lastmalariastatus)
+
+intensitydat_MF$Observation_type_BFO_0000015 <-as.factor(intensitydat_MF$Observation_type_BFO_0000015)
+intensitydat_MF$Drinking_water_source_ENVO_00003064 <-as.factor(intensitydat_MF$Drinking_water_source_ENVO_00003064)
+intensitydat_MF$Male <-as.factor(intensitydat_MF$Male)
+intensitydat_MF$Dwelling_type_ENVO_01000744 <-as.factor(intensitydat_MF$Dwelling_type_ENVO_01000744)
+intensitydat_MF$`Household_wealth_index,_categorical_EUPATH_0000143` <-as.factor(intensitydat_MF$`Household_wealth_index,_categorical_EUPATH_0000143`)
+intensitydat_MF$`Sub-county_in_Uganda_EUPATH_0000054` <-as.factor(intensitydat_MF$`Sub-county_in_Uganda_EUPATH_0000054`)
+intensitydat_MF$Food_problems_per_week_EUPATH_0000029 <-as.factor(intensitydat_MF$Food_problems_per_week_EUPATH_0000029)
+intensitydat_MF$scheduled <-as.factor(intensitydat_MF$scheduled)
+
+
+
+
+# registerDoParallel(cores= ncoresavailable-2)
+imp <- missForest(intensitydat_MF, maxiter = 5, ntree = 15, parallelize = "no") 
+
+intensitydat_MF$currentage <- imp$ximp$currentage
+iiw_MF <- iiwfun(intensitydat_MF)
+iiw_MF
+
+
+
+
+resultstab <- data.frame(matrix(NA, nrow = 6, ncol = 6))
+names(resultstab) <- c("Method", "widehat{beta_1}", "SE(widehat{beta_1})", "95% CI for $beta_1$", "OR", "95% CI for OR")
+resultstab[1, ] <- c("No Missingness (Truth)", unlist(iiw_fulldata,3))
+resultstab[2, ] <- c("CCA", unlist(iiw_CCA,3))
+resultstab[3, ] <- c("LOCF", unlist(iiw_LOCF,3))
+resultstab[4, ] <- c("SI-PPM", unlist(iiw_SI,3))
+resultstab[5, ] <- c("MI-PPM", ATE_MI, SE_MI, CI_MI, OR_MI, CI_OR_MI)
+resultstab[6, ] <- c("missForest", unlist(iiw_MF,3))
+
+kable(resultstab, digits = 3, format = "latex", booktabs = T)
