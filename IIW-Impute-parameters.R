@@ -169,7 +169,7 @@ t1 <- Sys.time()
 #                                           outcome, usesplines = F, scheme = "B",
 #                                           outputfulldatalist = TRUE, nclusters = nclusters)
 # saveRDS(results_binary_n100_B, "results_binary_n100_B.rds")
-t2 <- Sys.time()s
+t2 <- Sys.time()
 t2 - t1 #7 hours
 
 results_binary_n100_B <- readRDS("results_binary_n100_B.rds")
